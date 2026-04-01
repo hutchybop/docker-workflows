@@ -15,7 +15,7 @@ Important:
 ```yaml
 jobs:
   release:
-    uses: hutchybop/docker-workflows/.github/workflows/docker-release-reusable.yml@main
+    uses: hutchybop/docker-workflows/.github/workflows/docker-release-reusable.yml@v1
     with:
       image_name: ${{ github.repository }}
       dockerfile: ./Dockerfile
