@@ -1,0 +1,140 @@
+name: Docker Release Reusable
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: GHCR image name (owner/repo)
+        required: true
+        type: string
+      dockerfile:
+        description: Path to Dockerfile
+        required: false
+        type: string
+        default: ./Dockerfile
+      context:
+        description: Docker build context
+        required: false
+        type: string
+        default: .
+      platforms:
+        description: Target image platforms
+        required: false
+        type: string
+        default: linux/amd64
+      build_args:
+        description: Optional newline-delimited Docker build args
+        required: false
+        type: string
+        default: ""
+      resolve_node_versions:
+        description: Resolve NODE/PNPM/NPM versions from repo files
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag format
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "This workflow only supports tag refs."
+            exit 1
+          fi
+
+          if ! [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '${GITHUB_REF_NAME}' does not match required format vX.Y.Z."
+            exit 1
+          fi
+
+      - name: Ensure tagged commit is contained in main
+        shell: bash
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main"; then
+            echo "Tagged commit ${GITHUB_SHA} is not contained in origin/main."
+            exit 1
+          fi
+
+      - name: Resolve Node toolchain versions
+        id: versions
+        if: ${{ inputs.resolve_node_versions }}
+        shell: bash
+        run: |
+          node_version="$(tr -d '[:space:]' < .node-version)"
+          pnpm_version="$(python3 -c 'import json; p=json.load(open("package.json")); pm=p.get("packageManager", ""); print(pm.split("@", 1)[1] if "@" in pm else "")')"
+          npm_version="$(python3 -c 'import json; p=json.load(open("package.json")); print(p.get("engines", {}).get("npm", ""))')"
+
+          if [ -z "${node_version}" ] || [ -z "${pnpm_version}" ] || [ -z "${npm_version}" ]; then
+            echo "Missing pinned NODE/PNPM/NPM versions from .node-version and package.json."
+            exit 1
+          fi
+
+          {
+            echo "node=${node_version}"
+            echo "pnpm=${pnpm_version}"
+            echo "npm=${npm_version}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build argument payload
+        id: build_args
+        shell: bash
+        run: |
+          final_args="${{ inputs.build_args }}"
+
+          if [ "${{ inputs.resolve_node_versions }}" = "true" ]; then
+            final_args="${final_args}"$'\n'"NODE_VERSION=${{ steps.versions.outputs.node }}"$'\n'"PNPM_VERSION=${{ steps.versions.outputs.pnpm }}"$'\n'"NPM_VERSION=${{ steps.versions.outputs.npm }}"
+          fi
+
+          {
+            echo "value<<EOF"
+            printf '%s\n' "${final_args}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ inputs.image_name }}
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.build_args.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
